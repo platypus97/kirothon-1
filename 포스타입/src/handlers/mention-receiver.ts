@@ -51,10 +51,22 @@ export function extractEventData(
 export async function handler(
   event: APIGatewayProxyEvent
 ): Promise<APIGatewayProxyResult> {
+  // Slack retries if response takes >3s. Skip retries to avoid duplicate processing.
+  const retryNum = event.headers?.["x-slack-retry-num"];
+  if (retryNum) {
+    console.log("Skipping Slack retry", { retryNum });
+    return { statusCode: 200, body: JSON.stringify({ ok: true, retry_skipped: true }) };
+  }
+
   let body: Record<string, unknown>;
 
   try {
-    body = JSON.parse(event.body ?? "{}");
+    // Function URL may send base64-encoded body
+    let rawBody = event.body ?? "{}";
+    if (event.isBase64Encoded && rawBody) {
+      rawBody = Buffer.from(rawBody, "base64").toString("utf-8");
+    }
+    body = JSON.parse(rawBody);
   } catch {
     console.error("Failed to parse request body");
     return { statusCode: 400, body: JSON.stringify({ error: "Invalid JSON" }) };
@@ -65,6 +77,7 @@ export async function handler(
     const verification = body as unknown as SlackUrlVerification;
     return {
       statusCode: 200,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ challenge: verification.challenge }),
     };
   }
@@ -89,10 +102,10 @@ export async function handler(
       textLength: eventData.text.length,
     });
 
-    // Fire-and-forget async processing for Slack's 3-second ACK requirement
-    processAnalysis(eventData).catch((error) => {
-      console.error("[MentionReceiver] Unhandled error in async processing", { error });
-    });
+    // Slack may retry if we take >3s, but we need to await here
+    // because Lambda Function URL terminates the process after returning.
+    // Slack retries are handled by checking x-slack-retry-num header.
+    await processAnalysis(eventData);
 
     return {
       statusCode: 200,
