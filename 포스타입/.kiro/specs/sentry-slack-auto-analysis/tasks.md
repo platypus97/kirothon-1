@@ -17,14 +17,8 @@ Slack 멘션 이벤트를 수신하여 Sentry 알림 메시지를 파싱하고, 
     - `src/types/` 에 설계 문서의 데이터 모델 구현: `SlackEventPayload`, `SlackUrlVerification`, `SlackAppMentionEvent`, `ParsedSentryAlert`, `BedrockAgentInput`, `AnalysisRequest`, `CollectedData`, `AnalysisResult`, `SlackThreadResponse`, `SlackRetryConfig`
     - _Requirements: 1.3, 2.1, 3.2, 5.2, 6.2_
 
-- [ ] 2. Slack 이벤트 수신 및 검증 구현
-  - [ ] 2.1 Slack 요청 서명 검증 함수 구현
-    - `src/utils/slack-signature.ts`에 Slack Signing Secret 기반 요청 서명 검증 함수 작성
-    - AWS Secrets Manager에서 Signing Secret 조회 로직 포함
-    - 검증 실패 시 HTTP 401 반환
-    - _Requirements: 8.1, 8.2, 8.3_
-
-  - [ ] 2.2 Slack 이벤트 핸들러 (Lambda 엔트리포인트) 구현
+- [ ] 2. Slack 이벤트 수신 구현
+  - [ ] 2.1 Slack 이벤트 핸들러 (Lambda 엔트리포인트) 구현
     - `src/handlers/mention-receiver.ts`에 Lambda 핸들러 작성
     - `url_verification` 챌린지 응답 처리
     - `app_mention` 이벤트에서 채널 ID, 스레드 TS(`thread_ts` 또는 `ts`), 메시지 텍스트 추출
@@ -32,19 +26,18 @@ Slack 멘션 이벤트를 수신하여 Sentry 알림 메시지를 파싱하고, 
     - 3초 이내 ACK 응답을 위해 비동기 처리 분리
     - _Requirements: 1.1, 1.2, 1.3, 1.4_
 
-  - [ ]* 2.3 Property 1 속성 테스트: Slack 이벤트 페이로드 파싱
+  - [ ]* 2.2 Property 1 속성 테스트: Slack 이벤트 페이로드 파싱
     - **Property 1: Slack 이벤트 페이로드 파싱**
     - 랜덤 채널 ID, 타임스탬프, 텍스트를 가진 Slack 이벤트 페이로드를 생성하여 추출 함수가 원본 필드와 일치하는 값을 반환하는지 검증
     - fast-check 사용, 최소 100회 반복
     - **Validates: Requirements 1.3**
 
-  - [ ]* 2.4 단위 테스트: Slack 이벤트 수신 및 검증
+  - [ ]* 2.3 단위 테스트: Slack 이벤트 수신
     - `url_verification` 챌린지 응답 테스트
     - 유효한 `app_mention` 이벤트 처리 테스트
     - 채널 ID 누락 시 요청 무시 테스트
     - 스레드 TS 누락 시 요청 무시 테스트
-    - Slack 서명 검증 실패 시 401 반환 테스트
-    - _Requirements: 1.1, 1.2, 1.3, 1.4, 8.1, 8.3_
+    - _Requirements: 1.1, 1.2, 1.3, 1.4_
 
 - [ ] 3. Sentry 알림 메시지 파싱 구현
   - [ ] 3.1 메시지 파싱 함수 구현
@@ -75,8 +68,8 @@ Slack 멘션 이벤트를 수신하여 Sentry 알림 메시지를 파싱하고, 
     - 스레드 응답 전송 기능 (`thread_ts` 지정)
     - 지수 백오프(1초, 2초, 4초) 기반 최대 3회 재시도 로직 구현
     - 3회 실패 후 CloudWatch Logs에 전송 실패 기록
-    - AWS Secrets Manager에서 Slack Bot 토큰 조회
-    - _Requirements: 6.1, 6.3, 6.4, 8.2_
+    - Slack Bot 토큰은 환경 변수에서 직접 조회
+    - _Requirements: 6.1, 6.3, 6.4_
 
   - [ ] 5.2 Bedrock Agent 호출 서비스 구현
     - `src/services/bedrock-agent-service.ts`에 Bedrock Agent 비동기 호출 함수 작성
@@ -135,32 +128,21 @@ Slack 멘션 이벤트를 수신하여 Sentry 알림 메시지를 파싱하고, 
     - 데이터 수집 실패 메모가 context 블록에 포함되는지 테스트
     - _Requirements: 5.2, 5.3, 6.2_
 
-- [ ] 8. 분석 처리 시간 제한 구현
-  - [ ] 8.1 타임아웃 처리 로직 구현
-    - `src/services/bedrock-agent-service.ts`에 120초 타임아웃 로직 추가
-    - 타임아웃 초과 시 부분 분석 결과와 함께 "분석 시간이 초과되었습니다. 수집된 데이터 범위 내에서 부분 결과를 제공합니다." 메시지를 Slack 스레드에 전송
-    - _Requirements: 7.1, 7.2_
-
-  - [ ]* 8.2 단위 테스트: 타임아웃 처리
-    - 120초 이내 정상 완료 테스트
-    - 120초 초과 시 부분 결과 전송 테스트
-    - _Requirements: 7.1, 7.2_
-
-- [ ] 9. 전체 통합 및 Lambda 핸들러 연결
-  - [ ] 9.1 Lambda 핸들러에 전체 플로우 통합
+- [ ] 8. 전체 통합 및 Lambda 핸들러 연결
+  - [ ] 8.1 Lambda 핸들러에 전체 플로우 통합
     - `src/handlers/mention-receiver.ts`에서 모든 컴포넌트를 연결하여 전체 플로우 구현
-    - 이벤트 수신 → 서명 검증 → 메시지 파싱 → Bedrock Agent 호출 → 결과 포맷팅 → Slack 응답 전송
+    - 이벤트 수신 → 메시지 파싱 → Bedrock Agent 호출 → 결과 포맷팅 → Slack 응답 전송
     - 각 단계별 오류 처리 및 CloudWatch 로깅 통합
     - _Requirements: 1.1, 1.2, 2.1, 3.1, 6.1_
 
-  - [ ]* 9.2 통합 테스트: 전체 플로우
+  - [ ]* 8.2 통합 테스트: 전체 플로우
     - 정상 플로우 (멘션 → 파싱 → 분석 → 응답) 통합 테스트
     - 문제 URL 추출 실패 시 안내 메시지 전송 통합 테스트
     - Bedrock Agent 호출 실패 시 오류 메시지 전송 통합 테스트
     - 부분 데이터 수집 실패 시 부분 결과 전송 통합 테스트
     - _Requirements: 1.1, 2.3, 3.4, 4.4, 4.5, 4.6, 6.1_
 
-- [ ] 10. 최종 체크포인트 - 전체 테스트 통과 확인
+- [ ] 9. 최종 체크포인트 - 전체 테스트 통과 확인
   - Ensure all tests pass, ask the user if questions arise.
 
 ## Notes
