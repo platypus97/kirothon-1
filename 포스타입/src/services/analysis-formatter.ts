@@ -150,7 +150,7 @@ export function parseAgentResponse(responseText: string): AnalysisResult {
     const content = trimmed.slice(start, end).trim();
     const key = matches[i]!.key as keyof typeof result;
     if (key in result && typeof result[key] === "string") {
-      (result as Record<string, unknown>)[key] = content;
+      (result as unknown as Record<string, unknown>)[key] = content;
     }
   }
 

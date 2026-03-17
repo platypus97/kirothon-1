@@ -1,0 +1,52 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Sentry-Slack Auto Analysis Bot
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: nodejs20.x
+    MemorySize: 256
+
+Parameters:
+  SlackBotToken:
+    Type: String
+    NoEcho: true
+    Description: Slack Bot OAuth Token (xoxb-...)
+  BedrockAgentId:
+    Type: String
+    Description: Bedrock Agent ID
+    Default: placeholder
+  BedrockAgentAliasId:
+    Type: String
+    Description: Bedrock Agent Alias ID
+    Default: placeholder
+
+Resources:
+  MentionReceiverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/handlers/mention-receiver.handler
+      CodeUri: .
+      Environment:
+        Variables:
+          SLACK_BOT_TOKEN: !Ref SlackBotToken
+          BEDROCK_AGENT_ID: !Ref BedrockAgentId
+          BEDROCK_AGENT_ALIAS_ID: !Ref BedrockAgentAliasId
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeAgent
+              Resource: '*'
+      Events:
+        SlackEvent:
+          Type: Api
+          Properties:
+            Path: /slack/events
+            Method: post
+
+Outputs:
+  SlackEventUrl:
+    Description: Slack Event Subscriptions에 등록할 URL
+    Value: !Sub 'https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/slack/events'
