@@ -21,11 +21,14 @@ sequenceDiagram
     Sentry->>Slack: 오류 알림 메시지 전송
     Slack->>Bot: 메시지 이벤트 수신 (Socket Mode / Events API)
     Bot->>Detector: 메시지 전달
-    Detector->>Detector: Sentry 알림 여부 판별
-    Detector->>Dedup: 이슈 ID 중복 확인
+    Detector->>Detector: Sentry 알림 여부 판별 (봇 이름/ID, 메시지 구조)
+    Detector->>Detector: Short ID, 프로젝트명, 에러 정보 추출
+    Detector->>Dedup: Short ID 중복 확인
     Dedup-->>Detector: 중복 아님
-    Detector->>Collector: Sentry 이슈 URL/ID 전달
-    Collector->>Sentry: API로 상세 정보 조회
+    Detector->>Collector: Short ID + SentryAlertInfo 전달
+    Collector->>Sentry: Short ID로 이슈 조회 (/shortids/{short_id}/)
+    Sentry-->>Collector: 이슈 ID + 기본 정보
+    Collector->>Sentry: 이슈 ID로 최신 이벤트 조회 (/events/latest/)
     Sentry-->>Collector: 스택트레이스, 태그, 브레드크럼 등
     Collector->>Analyzer: 구조화된 오류 정보 전달
     Analyzer->>Analyzer: LLM 기반 원인 분석
@@ -95,10 +98,51 @@ src/
 
 Slack 메시지가 Sentry 알림인지 판별하고, 이슈 정보를 추출한다.
 
+#### 실제 Sentry Slack 알림 메시지 구조
+
+Sentry 앱이 Slack으로 전송하는 알림 메시지는 다음과 같은 구조를 가진다:
+
+```
+발신자: "Sentry" (Slack 봇 앱)
+─────────────────────────────────────
+🔴 ApiError: /editor/v1/open-channel/post/{id}/publish
+/mobile/channel/:channelName/open-editor/:postId
+
+┌─────────────────────────────────────┐
+│ Request failed with status code 500 │
+└─────────────────────────────────────┘
+
+Events: 39  Users Affected: 2  State: Ongoing  First Seen: 2026-02-19
+
+[Resolve] [Archive] [Select Assignee...]
+
+⚠️ [fatal 에러 급증] ⚠️  @front  @back
+
+Project: javascript-nextjs  Alert: Send a notification for fatal error spikes
+Short ID: JAVASCRIPT-NEXTJS-3A11  View Replays
+
+💬 4개의 댓글  5일 전 마지막 댓글
+```
+
+#### 인터페이스
+
 ```typescript
+interface SentryAlertInfo {
+  errorTitle: string;          // 예: "ApiError: /editor/v1/open-channel/post/{id}/publish"
+  routePath: string | null;    // 예: "/mobile/channel/:channelName/open-editor/:postId"
+  errorMessage: string;        // 예: "Request failed with status code 500"
+  eventCount: number;          // 예: 39
+  usersAffected: number;       // 예: 2
+  state: string;               // 예: "Ongoing"
+  firstSeen: string;           // 예: "2026-02-19"
+  projectSlug: string;         // 예: "javascript-nextjs"
+  shortId: string;             // 예: "JAVASCRIPT-NEXTJS-3A11"
+  alertRule: string | null;    // 예: "Send a notification for fatal error spikes"
+}
+
 interface DetectionResult {
   isSentryAlert: boolean;
-  issueId: string | null;
+  alertInfo: SentryAlertInfo | null;
   issueUrl: string | null;
   threadTs: string;
   channelId: string;
@@ -109,9 +153,20 @@ interface MessageDetector {
 }
 ```
 
-판별 기준:
-- 메시지 발신자가 Sentry 봇 사용자 ID와 일치
-- 메시지 본문에 Sentry 이슈 URL 패턴 포함 (`https://<org>.sentry.io/issues/<id>`)
+#### 판별 기준 (우선순위 순)
+
+1. **봇 이름 확인**: 메시지의 `bot_id` 또는 `username`이 설정된 Sentry 봇 ID와 일치
+2. **메시지 구조 확인**: Sentry 알림 특유의 구조적 패턴 존재 여부
+   - attachments 또는 blocks에 "Short ID" 필드 포함
+   - "Events:", "Users Affected:", "State:" 메타 정보 패턴
+   - "Project:" 필드 존재
+3. **URL 패턴 확인**: 메시지 본문 또는 attachments에 Sentry 이슈 URL 패턴 포함 (`https://<org>.sentry.io/issues/<id>`)
+
+#### Short ID 추출
+
+Sentry 알림 메시지의 하단에 포함된 `Short ID` (예: `JAVASCRIPT-NEXTJS-3A11`)를 추출한다. 이 Short ID는 Sentry API를 통해 이슈 상세 정보를 조회하는 데 사용된다.
+
+추출 정규식: `/Short ID:\s*([A-Z0-9]+-[A-Z0-9-]+)/`
 
 ### 2. DedupCache
 
@@ -130,40 +185,54 @@ interface DedupCache {
 
 ### 3. SentryCollector
 
-Sentry API를 호출하여 오류 상세 정보를 수집하고 구조화한다.
+Sentry API를 호출하여 오류 상세 정보를 수집하고 구조화한다. Short ID를 기반으로 이슈를 조회한다.
 
 ```typescript
 interface SentryErrorDetail {
-  issueId: string;
+  issueId: string;             // Sentry 내부 이슈 ID (숫자)
+  shortId: string;             // 예: "JAVASCRIPT-NEXTJS-3A11"
   title: string;
   errorMessage: string;
   stacktrace: string;
-  projectName: string;
+  projectSlug: string;         // 예: "javascript-nextjs"
   level: string;
   environment: string;
   tags: Record<string, string>;
   breadcrumbs: Breadcrumb[];
   issueUrl: string;
+  // Slack 메시지에서 추출한 보조 정보
+  slackAlertInfo: SentryAlertInfo;
 }
 
 interface SentryCollector {
-  collect(issueId: string): Promise<SentryErrorDetail>;
+  collectByShortId(organizationSlug: string, shortId: string): Promise<SentryErrorDetail>;
+  collectByIssueId(issueId: string): Promise<SentryErrorDetail>;
 }
 ```
 
-- Sentry API 엔드포인트: `GET /api/0/issues/{issue_id}/events/latest/`
-- 실패 시 `null` 반환, 호출자가 fallback 처리
+#### Short ID 기반 조회 흐름
+
+1. Short ID로 이슈 조회: `GET /api/0/organizations/{org_slug}/shortids/{short_id}/`
+   - 응답에서 `group.id` (이슈 ID)와 `group` 상세 정보 획득
+2. 이슈 ID로 최신 이벤트 조회: `GET /api/0/issues/{issue_id}/events/latest/`
+   - 스택트레이스, 태그, 브레드크럼 등 상세 정보 획득
+
+#### Fallback 전략
+
+- Short ID 조회 실패 시: Slack 메시지 본문에서 추출한 `SentryAlertInfo`만으로 분석 진행
+- 이슈 URL이 있는 경우: URL에서 이슈 ID를 추출하여 `collectByIssueId`로 재시도
+- 모든 API 호출 실패 시: `SentryAlertInfo`의 정보(에러 제목, 에러 메시지, 프로젝트명, 이벤트 수, 영향 사용자 수)를 기반으로 LLM 분석 진행
 
 ### 4. LLMAnalyzer
 
-수집된 오류 정보를 LLM에 전달하여 분석 결과를 생성한다.
+수집된 오류 정보를 LLM에 전달하여 분석 결과를 생성한다. Sentry API 조회 성공 시 상세 정보를, 실패 시 Slack 메시지에서 추출한 `SentryAlertInfo`를 기반으로 분석한다.
 
 ```typescript
 interface AnalysisResult {
   summary: string;           // 오류 요약
   rootCause: string;         // 추정 원인
-  impactScope: string;       // 영향 범위
-  relatedCode: string;       // 관련 코드 영역 추정
+  impactScope: string;       // 영향 범위 (이벤트 수, 영향 사용자 수 포함)
+  relatedCode: string;       // 관련 코드 영역 추정 (경로 정보 활용)
   possibleScenarios: string; // 발생 가능 시나리오
   solutions: string[];       // 해결 대안 (최소 1개)
   immediateActions: string[];// 즉시 대응 조치
@@ -171,6 +240,7 @@ interface AnalysisResult {
 
 interface LLMAnalyzer {
   analyze(errorDetail: SentryErrorDetail): Promise<AnalysisResult>;
+  analyzeFromSlackInfo(alertInfo: SentryAlertInfo): Promise<AnalysisResult>;
 }
 ```
 
@@ -227,10 +297,12 @@ interface AppConfig {
     appToken: string;        // 환경 변수에서 로드
     channelIds: string[];
     sentryBotUserId: string;
+    sentryBotName: string;   // Sentry 앱 봇 표시 이름 (예: "Sentry")
   };
   sentry: {
     apiToken: string;        // 환경 변수에서 로드
     baseUrl: string;
+    organizationSlug: string; // Short ID 조회에 필요
   };
   llm: {
     apiKey: string;          // 환경 변수에서 로드
@@ -265,9 +337,11 @@ slack:
   channelIds:
     - "C01XXXXXXXX"
   sentryBotUserId: "U02XXXXXXXX"
+  sentryBotName: "Sentry"       # Sentry 앱 봇 표시 이름
 
 sentry:
   baseUrl: "https://sentry.io"
+  organizationSlug: "my-org"    # Short ID 조회에 필요
 
 llm:
   model: "gpt-4o"
@@ -291,19 +365,93 @@ adminSlackUserId: "U07XXXXXXXX"
 
 ### Slack 메시지 이벤트 (수신)
 
+Sentry 앱이 Slack으로 전송하는 메시지는 Slack의 Bot Message 형식을 따른다. 주요 정보는 `attachments`와 `blocks` 필드에 구조화되어 있다.
+
 ```typescript
 interface SlackMessage {
   type: string;
-  user: string;              // 발신자 ID
-  text: string;              // 메시지 본문
-  ts: string;                // 메시지 타임스탬프
-  channel: string;           // 채널 ID
-  bot_id?: string;           // 봇 메시지인 경우
+  subtype?: string;            // "bot_message"인 경우 봇 발신
+  user?: string;               // 사용자 발신 시
+  bot_id?: string;             // 봇 발신 시 봇 ID
+  username?: string;           // 봇 표시 이름 (예: "Sentry")
+  text: string;                // 메시지 본문 (fallback 텍스트)
+  ts: string;                  // 메시지 타임스탬프
+  channel: string;             // 채널 ID
   attachments?: SlackAttachment[];
+  blocks?: SlackBlock[];
+}
+
+interface SlackAttachment {
+  color?: string;              // Sentry 알림은 보통 빨간색 (#E03E2F)
+  title?: string;              // 오류 제목 (예: "🔴 ApiError: ...")
+  title_link?: string;         // Sentry 이슈 URL
+  text?: string;               // 에러 메시지 (코드 블록)
+  fields?: SlackAttachmentField[];  // 메타 정보 (Events, Users Affected 등)
+  footer?: string;             // 하단 정보 (Project, Short ID 등)
+  actions?: SlackAction[];     // 버튼 (Resolve, Archive 등)
+  mrkdwn_in?: string[];
+}
+
+interface SlackAttachmentField {
+  title: string;               // 예: "Events", "Users Affected", "State"
+  value: string;               // 예: "39", "2", "Ongoing"
+  short: boolean;
+}
+
+interface SlackAction {
+  type: string;                // "button"
+  text: string;                // "Resolve", "Archive", "Select Assignee..."
+  name: string;
+  value: string;
 }
 ```
 
+### Sentry 알림 메시지에서 추출 가능한 정보
+
+| 추출 위치 | 필드 | 예시 값 | 용도 |
+|-----------|------|---------|------|
+| attachment.title | 오류 제목 | `🔴 ApiError: /editor/v1/open-channel/post/{id}/publish` | LLM 분석 입력 |
+| attachment.text (첫 번째 줄) | 경로 정보 | `/mobile/channel/:channelName/open-editor/:postId` | 관련 코드 영역 추정 |
+| attachment.text (코드 블록) | 에러 메시지 | `Request failed with status code 500` | LLM 분석 입력 |
+| attachment.fields | 이벤트 수 | `39` | 심각도 판단 |
+| attachment.fields | 영향 사용자 수 | `2` | 영향 범위 판단 |
+| attachment.fields | 상태 | `Ongoing` | 현재 상태 확인 |
+| attachment.fields | 최초 발생일 | `2026-02-19` | 시간 컨텍스트 |
+| attachment.footer | 프로젝트명 | `javascript-nextjs` | 담당자 매핑, Sentry API 조회 |
+| attachment.footer | Short ID | `JAVASCRIPT-NEXTJS-3A11` | Sentry API 이슈 조회 키 |
+| attachment.footer | 알림 규칙 | `Send a notification for fatal error spikes` | 알림 컨텍스트 |
+| attachment.title_link | Sentry 이슈 URL | `https://org.sentry.io/issues/12345/` | 응답에 링크 포함 |
+| text (notes 영역) | 알림 노트 | `⚠️ [fatal 에러 급증] ⚠️  @front  @back` | 심각도 컨텍스트 |
+
 ### Sentry API 응답 (주요 필드)
+
+#### Short ID 조회 응답 (`GET /api/0/organizations/{org_slug}/shortids/{short_id}/`)
+
+```typescript
+interface SentryShortIdResponse {
+  organizationSlug: string;
+  projectSlug: string;
+  group: {
+    id: string;                // 이슈 ID (숫자 문자열)
+    title: string;
+    shortId: string;           // 예: "JAVASCRIPT-NEXTJS-3A11"
+    status: string;
+    level: string;
+    count: string;
+    userCount: number;
+    firstSeen: string;
+    lastSeen: string;
+    project: {
+      id: string;
+      name: string;
+      slug: string;
+    };
+  };
+  shortId: string;
+}
+```
+
+#### 최신 이벤트 조회 응답 (`GET /api/0/issues/{issue_id}/events/latest/`)
 
 ```typescript
 interface SentryEventResponse {
@@ -331,7 +479,7 @@ type DedupStore = Map<string, number>;
 
 ### Property 1: Sentry 알림 판별 정확성
 
-*임의의* Slack 메시지에 대해, 해당 메시지의 발신자가 Sentry 봇 사용자 ID와 일치하거나 메시지 본문에 Sentry 이슈 URL 패턴이 포함된 경우에만 Sentry 알림으로 판별되어야 하며, 그 외의 메시지는 Sentry 알림이 아닌 것으로 판별되어야 한다.
+*임의의* Slack 메시지에 대해, 해당 메시지의 발신자가 Sentry 봇 사용자 ID/이름과 일치하고 메시지에 Short ID 패턴, "Events:", "Project:" 등 Sentry 알림 구조적 패턴이 포함된 경우에만 Sentry 알림으로 판별되어야 하며, 그 외의 메시지는 Sentry 알림이 아닌 것으로 판별되어야 한다.
 
 **Validates: Requirements 1.1, 1.2, 1.3**
 
@@ -341,15 +489,15 @@ type DedupStore = Map<string, number>;
 
 **Validates: Requirements 1.4**
 
-### Property 3: Sentry 이슈 ID 추출 정확성
+### Property 3: Short ID 및 메타 정보 추출 정확성
 
-*임의의* Sentry 이슈 URL을 포함한 메시지에 대해, 추출된 이슈 ID는 원본 URL에 포함된 이슈 ID와 정확히 일치해야 한다.
+*임의의* Sentry 알림 메시지에 대해, 추출된 Short ID는 메시지 footer에 포함된 Short ID와 정확히 일치해야 하며, 프로젝트명, 이벤트 수, 영향 사용자 수, 에러 메시지 등 메타 정보가 원본 메시지의 값과 일치해야 한다.
 
 **Validates: Requirements 2.1**
 
 ### Property 4: Sentry API 응답 구조화
 
-*임의의* 유효한 Sentry API 응답에 대해, 구조화 변환 결과는 SentryErrorDetail의 모든 필수 필드(issueId, title, errorMessage, stacktrace, projectName, level, environment, tags, breadcrumbs, issueUrl)를 포함해야 한다.
+*임의의* 유효한 Sentry API 응답에 대해, 구조화 변환 결과는 SentryErrorDetail의 모든 필수 필드(issueId, shortId, title, errorMessage, stacktrace, projectSlug, level, environment, tags, breadcrumbs, issueUrl, slackAlertInfo)를 포함해야 한다.
 
 **Validates: Requirements 2.2, 2.4**
 
@@ -456,8 +604,8 @@ async function withRetry<T>(
 
 단위 테스트는 구체적인 예시, 에지 케이스, 오류 조건에 집중한다.
 
-- **MessageDetector**: Sentry 봇 메시지, Sentry URL 포함 메시지, 일반 메시지 각각의 판별 결과
-- **SentryCollector**: API 실패 시 fallback 동작 (요구사항 2.3)
+- **MessageDetector**: Sentry 봇 메시지 (봇 이름 "Sentry", Short ID 포함), Sentry URL 포함 메시지, 일반 메시지 각각의 판별 결과. Short ID/프로젝트명/이벤트 수 등 메타 정보 추출 정확성
+- **SentryCollector**: Short ID 기반 조회 성공, Short ID 조회 실패 시 fallback 동작, API 실패 시 SentryAlertInfo 기반 분석 진행 (요구사항 2.3)
 - **LLMAnalyzer**: LLM API 실패 시 기본 응답 생성 (요구사항 3.4)
 - **ThreadResponder**: Slack API 재시도 로직 (3회 재시도 후 관리자 알림, 요구사항 5.4, 5.5)
 - **ConfigManager**: 필수 설정 누락 시 오류 메시지 검증
@@ -472,16 +620,16 @@ async function withRetry<T>(
 
 | 속성 | 테스트 대상 모듈 | 생성기 |
 |------|----------------|--------|
-| Property 1 | MessageDetector | 임의의 SlackMessage (Sentry 봇 ID / Sentry URL / 일반 메시지) |
+| Property 1 | MessageDetector | 임의의 SlackMessage (Sentry 봇 ID/이름 + 구조적 패턴 / 일반 메시지) |
 | Property 2 | MessageDetector | 임의의 Sentry 알림 메시지 + ts 값 |
-| Property 3 | MessageDetector | 임의의 Sentry 이슈 URL 문자열 |
-| Property 4 | SentryCollector | 임의의 SentryEventResponse 객체 |
+| Property 3 | MessageDetector | 임의의 Sentry 알림 메시지 (Short ID, 프로젝트명, 이벤트 수, 에러 메시지 포함) |
+| Property 4 | SentryCollector | 임의의 SentryShortIdResponse + SentryEventResponse 객체 |
 | Property 5 | LLMAnalyzer | 임의의 SentryErrorDetail 객체 |
 | Property 6 | LLMAnalyzer | 임의의 AnalysisResult 객체 |
 | Property 7 | AssigneeMapper | 임의의 프로젝트명 + 오류 유형 + 매핑 설정 |
 | Property 8 | ThreadResponder | 임의의 AnalysisResult + 담당자 ID + 이슈 URL |
-| Property 9 | DedupCache | 임의의 이슈 ID 문자열 |
-| Property 10 | DedupCache | 임의의 이슈 ID + TTL 값 |
+| Property 9 | DedupCache | 임의의 Short ID 문자열 |
+| Property 10 | DedupCache | 임의의 Short ID + TTL 값 |
 | Property 11 | ConfigManager | 임의의 유효한 AppConfig 객체 |
 | Property 12 | ConfigManager | 임의의 필수 필드 누락 설정 |
 
