@@ -6,14 +6,14 @@ Slack 멘션 이벤트를 수신하여 Sentry 알림 메시지를 파싱하고, 
 
 ## Tasks
 
-- [ ] 1. 프로젝트 구조 및 핵심 타입 정의
-  - [ ] 1.1 프로젝트 초기화 및 디렉토리 구조 생성
+- [x] 1. 프로젝트 구조 및 핵심 타입 정의
+  - [x] 1.1 프로젝트 초기화 및 디렉토리 구조 생성
     - Node.js 20.x 기반 TypeScript 프로젝트 초기화 (`package.json`, `tsconfig.json`)
     - `src/` 하위에 `handlers/`, `parsers/`, `services/`, `types/`, `utils/` 디렉토리 생성
     - 의존성 설치: `@aws-sdk/client-bedrock-agent-runtime`, `@slack/web-api`, `fast-check` (devDependency)
     - _Requirements: 전체_
 
-  - [ ] 1.2 핵심 인터페이스 및 타입 정의
+  - [x] 1.2 핵심 인터페이스 및 타입 정의
     - `src/types/` 에 설계 문서의 데이터 모델 구현: `SlackEventPayload`, `SlackUrlVerification`, `SlackAppMentionEvent`, `ParsedSentryAlert`, `BedrockAgentInput`, `AnalysisRequest`, `CollectedData`, `AnalysisResult`, `SlackThreadResponse`, `SlackRetryConfig`
     - _Requirements: 1.3, 2.1, 3.2, 5.2, 6.2_
 
@@ -47,7 +47,7 @@ Slack 멘션 이벤트를 수신하여 Sentry 알림 메시지를 파싱하고, 
     - 문제 URL 추출 실패 시 `null` 반환
     - _Requirements: 2.1, 2.2, 2.3_
 
-  - [ ]* 3.2 Property 2 속성 테스트: Sentry 알림 메시지 파싱 및 URL 필터링
+  - [x]* 3.2 Property 2 속성 테스트: Sentry 알림 메시지 파싱 및 URL 필터링
     - **Property 2: Sentry 알림 메시지 파싱 및 URL 필터링**
     - Sentry URL과 서비스 URL이 혼합된 랜덤 메시지 텍스트를 생성하여 파싱 함수가 Sentry URL을 제외하고 서비스 URL만 반환하는지 검증
     - fast-check 사용, 최소 100회 반복
@@ -63,7 +63,7 @@ Slack 멘션 이벤트를 수신하여 Sentry 알림 메시지를 파싱하고, 
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 5. Bedrock Agent 호출 및 상태 메시지 전송 구현
-  - [ ] 5.1 Slack 메시지 전송 유틸리티 구현
+  - [x] 5.1 Slack 메시지 전송 유틸리티 구현
     - `src/utils/slack-messenger.ts`에 Slack Web API를 사용한 메시지 전송 함수 작성
     - 스레드 응답 전송 기능 (`thread_ts` 지정)
     - 지수 백오프(1초, 2초, 4초) 기반 최대 3회 재시도 로직 구현
@@ -71,7 +71,7 @@ Slack 멘션 이벤트를 수신하여 Sentry 알림 메시지를 파싱하고, 
     - Slack Bot 토큰은 환경 변수에서 직접 조회
     - _Requirements: 6.1, 6.3, 6.4_
 
-  - [ ] 5.2 Bedrock Agent 호출 서비스 구현
+  - [x] 5.2 Bedrock Agent 호출 서비스 구현
     - `src/services/bedrock-agent-service.ts`에 Bedrock Agent 비동기 호출 함수 작성
     - `BedrockAgentInput` 파라미터 5개 필드(문제 URL, 오류 유형, 오류 메시지, 채널 ID, 스레드 TS) 전달
     - 호출 실패 시 Slack 스레드에 오류 메시지 전송
@@ -97,14 +97,14 @@ Slack 멘션 이벤트를 수신하여 Sentry 알림 메시지를 파싱하고, 
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 7. 분석 결과 처리 및 Block Kit 응답 구현
-  - [ ] 7.1 분석 결과 포맷터 구현
+  - [x] 7.1 분석 결과 포맷터 구현
     - `src/services/analysis-formatter.ts`에 `AnalysisResult`를 Slack Block Kit 형식으로 변환하는 함수 작성
     - 필수 5개 항목(오류 요약, 추정 원인, 관련 코드 위치, 영향 범위, 권장 대응 방안) 블록 생성
     - 부분 실패 시 `dataCollectionNotes`를 context 블록으로 추가
     - 부분 결과(`isPartialResult`) 여부에 따른 안내 메시지 포함
     - _Requirements: 5.2, 6.2, 4.4, 4.5, 4.6_
 
-  - [ ]* 7.2 Property 4 속성 테스트: 부분 실패 허용
+  - [~]* 7.2 Property 4 속성 테스트: 부분 실패 허용
     - **Property 4: 부분 실패 허용 (Partial Failure Tolerance)**
     - 3개 데이터 소스의 성공/실패 조합(2^3 = 8가지)을 랜덤 생성하여, 최소 하나의 소스가 성공하면 분석 결과가 생성되고 실패 소스가 `dataCollectionNotes`에 명시되는지 검증
     - fast-check 사용, 최소 100회 반복
@@ -128,8 +128,8 @@ Slack 멘션 이벤트를 수신하여 Sentry 알림 메시지를 파싱하고, 
     - 데이터 수집 실패 메모가 context 블록에 포함되는지 테스트
     - _Requirements: 5.2, 5.3, 6.2_
 
-- [ ] 8. 전체 통합 및 Lambda 핸들러 연결
-  - [ ] 8.1 Lambda 핸들러에 전체 플로우 통합
+- [x] 8. 전체 통합 및 Lambda 핸들러 연결
+  - [x] 8.1 Lambda 핸들러에 전체 플로우 통합
     - `src/handlers/mention-receiver.ts`에서 모든 컴포넌트를 연결하여 전체 플로우 구현
     - 이벤트 수신 → 메시지 파싱 → Bedrock Agent 호출 → 결과 포맷팅 → Slack 응답 전송
     - 각 단계별 오류 처리 및 CloudWatch 로깅 통합
@@ -142,7 +142,7 @@ Slack 멘션 이벤트를 수신하여 Sentry 알림 메시지를 파싱하고, 
     - 부분 데이터 수집 실패 시 부분 결과 전송 통합 테스트
     - _Requirements: 1.1, 2.3, 3.4, 4.4, 4.5, 4.6, 6.1_
 
-- [ ] 9. 최종 체크포인트 - 전체 테스트 통과 확인
+- [x] 9. 최종 체크포인트 - 전체 테스트 통과 확인
   - Ensure all tests pass, ask the user if questions arise.
 
 ## Notes

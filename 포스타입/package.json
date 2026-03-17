@@ -1,0 +1,25 @@
+{
+  "name": "sentry-slack-auto-analysis",
+  "version": "1.0.0",
+  "description": "Sentry-Slack 자동 분석 봇 Lambda",
+  "main": "dist/handlers/mention-receiver.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest --run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-agent-runtime": "^3.700.0",
+    "@slack/web-api": "^7.8.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^20.17.0",
+    "fast-check": "^3.23.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
