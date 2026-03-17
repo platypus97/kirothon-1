@@ -2,7 +2,7 @@
 
 ## 개요
 
-Sentry에서 Slack으로 전달되는 오류 알림을 자동으로 감지하고, Sentry API를 통해 상세 정보를 수집한 뒤, LLM을 활용하여 원인 분석 및 해결 대안을 생성하여 Slack 스레드에 자동 응답하는 시스템이다.
+Sentry에서 Slack으로 전달되는 오류 알림을 자동으로 감지하고, Sentry MCP(Model Context Protocol) 서버의 도구를 통해 상세 정보를 수집한 뒤, Sentry Seer AI 분석과 LLM을 결합하여 체계적인 원인 분석 보고서를 생성하고 Slack 스레드에 자동 응답하는 시스템이다.
 
 ### 핵심 흐름
 
@@ -13,7 +13,8 @@ sequenceDiagram
     participant Bot as Slack 봇
     participant Detector as 메시지 감지기
     participant Dedup as 중복 처리기
-    participant Collector as 정보 수집기
+    participant Collector as 정보 수집기 (MCP)
+    participant Seer as Sentry Seer (MCP)
     participant Analyzer as LLM 분석기
     participant Mapper as 담당자 매퍼
     participant Responder as 스레드 응답기
@@ -26,16 +27,16 @@ sequenceDiagram
     Detector->>Dedup: Short ID 중복 확인
     Dedup-->>Detector: 중복 아님
     Detector->>Collector: Short ID + SentryAlertInfo 전달
-    Collector->>Sentry: Short ID로 이슈 조회 (/shortids/{short_id}/)
-    Sentry-->>Collector: 이슈 ID + 기본 정보
-    Collector->>Sentry: 이슈 ID로 최신 이벤트 조회 (/events/latest/)
-    Sentry-->>Collector: 스택트레이스, 태그, 브레드크럼 등
-    Collector->>Analyzer: 구조화된 오류 정보 전달
-    Analyzer->>Analyzer: LLM 기반 원인 분석
+    Collector->>Collector: Sentry MCP get_issue_details 호출
+    Collector-->>Collector: 이슈 상세 정보 (스택트레이스, 태그, 컨텍스트 등)
+    Collector->>Seer: Sentry MCP analyze_issue_with_seer 호출
+    Seer-->>Collector: Seer AI 근본 원인 분석 + 코드 수정 제안
+    Collector->>Analyzer: 구조화된 오류 정보 + Seer 분석 결과 전달
+    Analyzer->>Analyzer: LLM 기반 종합 분석 (Seer 결과 + 비즈니스 컨텍스트)
     Analyzer->>Mapper: 프로젝트명, 오류 유형 전달
     Mapper-->>Analyzer: 담당자 Slack ID
-    Analyzer->>Responder: 분석 결과 + 담당자 정보
-    Responder->>Slack: 스레드에 Block Kit 형식 응답
+    Analyzer->>Responder: 분석 보고서 + 담당자 정보
+    Responder->>Slack: 스레드에 Block Kit 형식 보고서 응답
 ```
 
 ### 기술 스택 결정
@@ -44,11 +45,19 @@ sequenceDiagram
 |------|------|------|
 | 런타임 | Node.js (TypeScript) | Slack Bolt SDK의 공식 지원, 비동기 I/O에 적합 |
 | Slack 연동 | @slack/bolt | 공식 SDK, Socket Mode 지원, 이벤트 핸들링 내장 |
-| Sentry API | REST API (axios) | 공식 REST API, 별도 SDK 불필요 |
+| Sentry 정보 수집 | Sentry MCP 도구 | REST API 직접 호출 대신 MCP 프로토콜을 통한 도구 호출. `get_issue_details`, `analyze_issue_with_seer` 등 고수준 도구 활용 |
 | LLM | OpenAI API (openai SDK) | 구조화된 프롬프트 기반 분석에 적합 |
+| MCP 클라이언트 | @modelcontextprotocol/sdk | MCP 서버와의 통신을 위한 공식 SDK |
 | 설정 관리 | YAML (yaml 패키지) + 환경 변수 | 가독성, 핫 리로드 용이 |
 | 캐시 | 인메모리 Map + TTL | 단일 인스턴스 운영 기준, 외부 의존성 최소화 |
 | 테스트 | Vitest + fast-check | 빠른 실행, PBT 지원 |
+
+### investigate 스킬 참고 사항
+
+본 시스템의 분석 보고서 구조는 investigate 스킬의 접근 방식을 참고한다:
+- 증상, 영향 범위, 관련 데이터, 발생 시점 등을 체계적으로 정리
+- 근본 원인과 보조 원인을 구분
+- 위험도 평가 (🔴 높음 / ⚠️ 중간 / 🟢 낮음)
 
 ## 아키텍처
 
@@ -58,7 +67,7 @@ sequenceDiagram
 graph LR
     A[Slack Event Listener] --> B[Message Detector]
     B --> C[Dedup Cache]
-    C --> D[Sentry Collector]
+    C --> D[Sentry MCP Collector]
     D --> E[LLM Analyzer]
     E --> F[Assignee Mapper]
     F --> G[Thread Responder]
@@ -67,6 +76,8 @@ graph LR
     H -.-> D
     H -.-> E
     H -.-> F
+    
+    I[Sentry MCP Server] <-.-> D
 ```
 
 ### 모듈 구조
@@ -81,9 +92,9 @@ src/
 ├── dedup/
 │   └── dedupCache.ts        # 중복 이슈 필터링 (TTL 캐시)
 ├── collector/
-│   └── sentryCollector.ts   # Sentry API 호출 및 정보 구조화
+│   └── sentryMcpCollector.ts # Sentry MCP 도구 호출 및 정보 구조화
 ├── analyzer/
-│   └── llmAnalyzer.ts       # LLM 프롬프트 구성 및 분석 실행
+│   └── llmAnalyzer.ts       # LLM 프롬프트 구성 및 분석 실행 (Seer 결과 통합)
 ├── mapper/
 │   └── assigneeMapper.ts    # 담당자 매핑 조회
 ├── responder/
@@ -164,7 +175,7 @@ interface MessageDetector {
 
 #### Short ID 추출
 
-Sentry 알림 메시지의 하단에 포함된 `Short ID` (예: `JAVASCRIPT-NEXTJS-3A11`)를 추출한다. 이 Short ID는 Sentry API를 통해 이슈 상세 정보를 조회하는 데 사용된다.
+Sentry 알림 메시지의 하단에 포함된 `Short ID` (예: `JAVASCRIPT-NEXTJS-3A11`)를 추출한다. 이 Short ID는 Sentry MCP 도구를 통해 이슈 상세 정보를 조회하는 데 사용된다.
 
 추출 정규식: `/Short ID:\s*([A-Z0-9]+-[A-Z0-9-]+)/`
 
@@ -183,59 +194,148 @@ interface DedupCache {
 - TTL은 설정 파일에서 관리 (기본값: 30분)
 - `Map<string, number>` 기반, 주기적 만료 항목 정리
 
-### 3. SentryCollector
+### 3. SentryMcpCollector
 
-Sentry API를 호출하여 오류 상세 정보를 수집하고 구조화한다. Short ID를 기반으로 이슈를 조회한다.
+Sentry MCP 서버의 도구를 호출하여 오류 상세 정보를 수집하고 구조화한다. 기존 REST API 직접 호출 대신 MCP 프로토콜을 통해 고수준 도구를 활용한다.
+
+#### 사용하는 Sentry MCP 도구
+
+| 도구 | 용도 | 입력 |
+|------|------|------|
+| `get_issue_details` | 이슈 상세 정보 조회 (스택트레이스, 태그, 컨텍스트 등) | 이슈 Short ID 또는 URL |
+| `analyze_issue_with_seer` | AI 기반 근본 원인 분석 및 코드 수정 제안 | 이슈 ID |
+
+#### 인터페이스
 
 ```typescript
+// Seer AI 분석 결과
+interface SeerAnalysisResult {
+  rootCause: string | null;        // Seer가 추정한 근본 원인
+  codeFixSuggestions: string[];    // 코드 수정 제안
+  confidence: number | null;       // 분석 신뢰도 (0~1)
+  relatedFiles: string[];          // 관련 파일 경로
+}
+
 interface SentryErrorDetail {
-  issueId: string;             // Sentry 내부 이슈 ID (숫자)
+  issueId: string;             // Sentry 내부 이슈 ID
   shortId: string;             // 예: "JAVASCRIPT-NEXTJS-3A11"
   title: string;
   errorMessage: string;
   stacktrace: string;
-  projectSlug: string;         // 예: "javascript-nextjs"
+  projectSlug: string;
   level: string;
   environment: string;
   tags: Record<string, string>;
   breadcrumbs: Breadcrumb[];
   issueUrl: string;
+  // Seer AI 분석 결과
+  seerAnalysis: SeerAnalysisResult | null;
   // Slack 메시지에서 추출한 보조 정보
   slackAlertInfo: SentryAlertInfo;
 }
 
-interface SentryCollector {
-  collectByShortId(organizationSlug: string, shortId: string): Promise<SentryErrorDetail>;
-  collectByIssueId(issueId: string): Promise<SentryErrorDetail>;
+interface SentryMcpCollector {
+  collect(shortId: string, alertInfo: SentryAlertInfo): Promise<SentryErrorDetail>;
 }
 ```
 
-#### Short ID 기반 조회 흐름
+#### MCP 도구 호출 흐름
 
-1. Short ID로 이슈 조회: `GET /api/0/organizations/{org_slug}/shortids/{short_id}/`
-   - 응답에서 `group.id` (이슈 ID)와 `group` 상세 정보 획득
-2. 이슈 ID로 최신 이벤트 조회: `GET /api/0/issues/{issue_id}/events/latest/`
-   - 스택트레이스, 태그, 브레드크럼 등 상세 정보 획득
+```mermaid
+graph TD
+    A[Short ID 수신] --> B[get_issue_details 호출]
+    B -->|성공| C[이슈 상세 정보 획득]
+    B -->|실패| G[SentryAlertInfo만으로 진행]
+    C --> D[analyze_issue_with_seer 호출]
+    D -->|성공| E[Seer 분석 결과 획득]
+    D -->|실패| F[Seer 없이 진행]
+    E --> H[SentryErrorDetail 구조화]
+    F --> H
+    G --> H
+```
+
+1. **get_issue_details 호출**: Short ID를 전달하여 이슈 상세 정보 조회
+   - 스택트레이스, 태그, 브레드크럼, 컨텍스트 등 상세 정보 획득
+   - MCP 도구가 내부적으로 Sentry API 인증 및 호출을 처리
+2. **analyze_issue_with_seer 호출**: 이슈 ID를 전달하여 Seer AI 분석 실행
+   - 근본 원인 분석, 코드 수정 제안, 관련 파일 경로 등 획득
+   - Seer 분석은 선택적 — 실패해도 기본 분석은 진행
+
+#### MCP 클라이언트 구성
+
+```typescript
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+
+// MCP 클라이언트 초기화
+const transport = new StdioClientTransport({
+  command: 'npx',
+  args: ['-y', '@sentry/mcp-server'],
+  env: {
+    SENTRY_AUTH_TOKEN: process.env.SENTRY_AUTH_TOKEN,
+  },
+});
+
+const mcpClient = new Client({ name: 'sentry-slack-bot', version: '1.0.0' });
+await mcpClient.connect(transport);
+
+// 도구 호출 예시
+const issueDetails = await mcpClient.callTool({
+  name: 'get_issue_details',
+  arguments: { issue_id_or_url: shortId },
+});
+
+const seerAnalysis = await mcpClient.callTool({
+  name: 'analyze_issue_with_seer',
+  arguments: { issue_id: issueId },
+});
+```
 
 #### Fallback 전략
 
-- Short ID 조회 실패 시: Slack 메시지 본문에서 추출한 `SentryAlertInfo`만으로 분석 진행
-- 이슈 URL이 있는 경우: URL에서 이슈 ID를 추출하여 `collectByIssueId`로 재시도
-- 모든 API 호출 실패 시: `SentryAlertInfo`의 정보(에러 제목, 에러 메시지, 프로젝트명, 이벤트 수, 영향 사용자 수)를 기반으로 LLM 분석 진행
+- `get_issue_details` 실패 시: Slack 메시지 본문에서 추출한 `SentryAlertInfo`만으로 분석 진행
+- `analyze_issue_with_seer` 실패 시: Seer 분석 없이 LLM 분석만으로 진행 (`seerAnalysis: null`)
+- 모든 MCP 호출 실패 시: `SentryAlertInfo`의 정보(에러 제목, 에러 메시지, 프로젝트명, 이벤트 수, 영향 사용자 수)를 기반으로 LLM 분석 진행
 
 ### 4. LLMAnalyzer
 
-수집된 오류 정보를 LLM에 전달하여 분석 결과를 생성한다. Sentry API 조회 성공 시 상세 정보를, 실패 시 Slack 메시지에서 추출한 `SentryAlertInfo`를 기반으로 분석한다.
+수집된 오류 정보와 Seer AI 분석 결과를 결합하여 종합적인 분석 보고서를 생성한다. investigate 스킬의 분석 구조를 참고하여 체계적인 보고서를 작성한다.
+
+#### 분석 전략: Seer + LLM 결합
+
+- **Seer AI**: 코드 수준의 근본 원인 분석, 구체적인 코드 수정 제안 (기술적 분석)
+- **LLM**: 비즈니스 컨텍스트 분석, 영향 범위 평가, 위험도 판단, 즉시 대응 조치 (종합 분석)
+- 두 분석을 결합하여 기술적 깊이와 비즈니스 관점을 모두 갖춘 보고서 생성
+
+#### 인터페이스
 
 ```typescript
+// investigate 스킬 참고: 위험도 평가 포함
+type RiskLevel = 'high' | 'medium' | 'low';  // 🔴 높음 / ⚠️ 중간 / 🟢 낮음
+
 interface AnalysisResult {
-  summary: string;           // 오류 요약
-  rootCause: string;         // 추정 원인
-  impactScope: string;       // 영향 범위 (이벤트 수, 영향 사용자 수 포함)
-  relatedCode: string;       // 관련 코드 영역 추정 (경로 정보 활용)
-  possibleScenarios: string; // 발생 가능 시나리오
-  solutions: string[];       // 해결 대안 (최소 1개)
-  immediateActions: string[];// 즉시 대응 조치
+  // 증상 정리 (investigate 스킬 참고)
+  summary: string;               // 오류 요약 (증상)
+  symptoms: string[];            // 관찰된 증상 목록
+  
+  // 원인 분석 (근본 원인 + 보조 원인 구분)
+  rootCause: string;             // 근본 원인 (Seer 분석 + LLM 종합)
+  contributingFactors: string[]; // 보조 원인/기여 요인
+  
+  // 영향 평가
+  impactScope: string;           // 영향 범위 (이벤트 수, 영향 사용자 수 포함)
+  riskLevel: RiskLevel;          // 위험도 평가
+  
+  // 기술 분석
+  relatedCode: string;           // 관련 코드 영역 추정 (Seer 관련 파일 + 경로 정보)
+  possibleScenarios: string;     // 발생 가능 시나리오
+  
+  // 대응 방안
+  solutions: string[];           // 해결 대안 (Seer 코드 수정 제안 포함, 최소 1개)
+  immediateActions: string[];    // 즉시 대응 조치
+  
+  // Seer 분석 원본 (참고용)
+  seerInsights: SeerAnalysisResult | null;
 }
 
 interface LLMAnalyzer {
@@ -243,6 +343,15 @@ interface LLMAnalyzer {
   analyzeFromSlackInfo(alertInfo: SentryAlertInfo): Promise<AnalysisResult>;
 }
 ```
+
+#### LLM 프롬프트 구성
+
+Seer 분석 결과가 있는 경우, LLM 프롬프트에 다음 정보를 모두 포함한다:
+
+1. **오류 기본 정보**: 에러 메시지, 스택트레이스, 브레드크럼
+2. **Seer AI 분석 결과**: 근본 원인, 코드 수정 제안, 관련 파일
+3. **컨텍스트 정보**: 이벤트 수, 영향 사용자 수, 환경, 태그
+4. **분석 지시**: investigate 스킬 스타일의 체계적 분석 요청 (증상 정리, 근본/보조 원인 구분, 위험도 평가)
 
 - 타임아웃: 30초
 - 실패 시 기본 응답(오류 정보 요약만 포함) 생성
@@ -268,7 +377,37 @@ interface AssigneeMapper {
 
 ### 6. ThreadResponder
 
-분석 결과를 Slack Block Kit 형식으로 변환하여 스레드에 게시한다.
+분석 결과를 Slack Block Kit 형식으로 변환하여 스레드에 게시한다. investigate 스킬의 보고서 구조를 참고하여 가독성 높은 응답을 생성한다.
+
+#### 응답 형식 (investigate 스킬 참고)
+
+```
+🔍 Sentry 오류 자동 분석 보고서
+
+📋 증상 요약
+[오류 요약 및 관찰된 증상]
+
+🔴/⚠️/🟢 위험도: [높음/중간/낮음]
+영향 범위: [이벤트 수]건 발생, [사용자 수]명 영향
+
+🎯 근본 원인
+[Seer AI + LLM 종합 분석 결과]
+
+📌 보조 원인/기여 요인
+- [기여 요인 1]
+- [기여 요인 2]
+
+💡 해결 대안
+1. [Seer 코드 수정 제안 포함]
+2. [추가 해결 방안]
+
+⚡ 즉시 대응 조치
+- [즉시 조치 1]
+- [즉시 조치 2]
+
+👤 담당자: @[담당자]
+🔗 Sentry 이슈: [링크]
+```
 
 ```typescript
 interface ThreadResponse {
@@ -299,10 +438,10 @@ interface AppConfig {
     sentryBotUserId: string;
     sentryBotName: string;   // Sentry 앱 봇 표시 이름 (예: "Sentry")
   };
-  sentry: {
-    apiToken: string;        // 환경 변수에서 로드
-    baseUrl: string;
-    organizationSlug: string; // Short ID 조회에 필요
+  sentryMcp: {
+    command: string;         // MCP 서버 실행 명령 (예: "npx")
+    args: string[];          // MCP 서버 실행 인자 (예: ["-y", "@sentry/mcp-server"])
+    // SENTRY_AUTH_TOKEN은 환경 변수에서 MCP 서버로 전달
   };
   llm: {
     apiKey: string;          // 환경 변수에서 로드
@@ -325,6 +464,7 @@ interface ConfigManager {
 ```
 
 - 민감 정보(토큰, API 키)는 환경 변수에서 로드
+- Sentry 인증 토큰은 MCP 서버 프로세스의 환경 변수로 전달
 - 비민감 설정은 YAML 파일에서 관리
 - `fs.watch`로 파일 변경 감지, 콜백으로 리로드 알림
 
@@ -337,11 +477,11 @@ slack:
   channelIds:
     - "C01XXXXXXXX"
   sentryBotUserId: "U02XXXXXXXX"
-  sentryBotName: "Sentry"       # Sentry 앱 봇 표시 이름
+  sentryBotName: "Sentry"
 
-sentry:
-  baseUrl: "https://sentry.io"
-  organizationSlug: "my-org"    # Short ID 조회에 필요
+sentryMcp:
+  command: "npx"
+  args: ["-y", "@sentry/mcp-server"]
 
 llm:
   model: "gpt-4o"
@@ -417,52 +557,57 @@ interface SlackAction {
 | attachment.fields | 영향 사용자 수 | `2` | 영향 범위 판단 |
 | attachment.fields | 상태 | `Ongoing` | 현재 상태 확인 |
 | attachment.fields | 최초 발생일 | `2026-02-19` | 시간 컨텍스트 |
-| attachment.footer | 프로젝트명 | `javascript-nextjs` | 담당자 매핑, Sentry API 조회 |
-| attachment.footer | Short ID | `JAVASCRIPT-NEXTJS-3A11` | Sentry API 이슈 조회 키 |
+| attachment.footer | 프로젝트명 | `javascript-nextjs` | 담당자 매핑, MCP 도구 호출 |
+| attachment.footer | Short ID | `JAVASCRIPT-NEXTJS-3A11` | Sentry MCP 이슈 조회 키 |
 | attachment.footer | 알림 규칙 | `Send a notification for fatal error spikes` | 알림 컨텍스트 |
 | attachment.title_link | Sentry 이슈 URL | `https://org.sentry.io/issues/12345/` | 응답에 링크 포함 |
 | text (notes 영역) | 알림 노트 | `⚠️ [fatal 에러 급증] ⚠️  @front  @back` | 심각도 컨텍스트 |
 
-### Sentry API 응답 (주요 필드)
+### MCP 도구 응답 구조
 
-#### Short ID 조회 응답 (`GET /api/0/organizations/{org_slug}/shortids/{short_id}/`)
+#### get_issue_details 응답
+
+`get_issue_details` 도구는 이슈 ID나 URL을 입력받아 다음 정보를 반환한다:
 
 ```typescript
-interface SentryShortIdResponse {
-  organizationSlug: string;
-  projectSlug: string;
-  group: {
-    id: string;                // 이슈 ID (숫자 문자열)
-    title: string;
-    shortId: string;           // 예: "JAVASCRIPT-NEXTJS-3A11"
-    status: string;
-    level: string;
-    count: string;
-    userCount: number;
-    firstSeen: string;
-    lastSeen: string;
-    project: {
-      id: string;
-      name: string;
-      slug: string;
-    };
-  };
+interface McpIssueDetailsResponse {
+  issueId: string;
+  title: string;
   shortId: string;
+  status: string;
+  level: string;
+  platform: string;
+  project: { slug: string; name: string };
+  count: number;
+  userCount: number;
+  firstSeen: string;
+  lastSeen: string;
+  // 최신 이벤트 정보 포함
+  latestEvent: {
+    eventId: string;
+    message: string;
+    stacktrace: string;       // 포맷된 스택트레이스
+    tags: Record<string, string>;
+    breadcrumbs: Breadcrumb[];
+    context: Record<string, any>;
+    environment: string;
+  };
+  issueUrl: string;
 }
 ```
 
-#### 최신 이벤트 조회 응답 (`GET /api/0/issues/{issue_id}/events/latest/`)
+#### analyze_issue_with_seer 응답
 
 ```typescript
-interface SentryEventResponse {
-  eventID: string;
-  title: string;
-  message: string;
-  platform: string;
-  entries: SentryEntry[];    // 스택트레이스, 브레드크럼 등
-  tags: Array<{ key: string; value: string }>;
-  context: Record<string, any>;
-  projectID: string;
+interface McpSeerResponse {
+  rootCause: string | null;
+  fixSuggestions: Array<{
+    description: string;
+    filePath: string;
+    codeDiff: string;
+  }>;
+  confidence: number | null;
+  relatedFiles: string[];
 }
 ```
 
@@ -495,21 +640,21 @@ type DedupStore = Map<string, number>;
 
 **Validates: Requirements 2.1**
 
-### Property 4: Sentry API 응답 구조화
+### Property 4: MCP 응답 구조화 완전성
 
-*임의의* 유효한 Sentry API 응답에 대해, 구조화 변환 결과는 SentryErrorDetail의 모든 필수 필드(issueId, shortId, title, errorMessage, stacktrace, projectSlug, level, environment, tags, breadcrumbs, issueUrl, slackAlertInfo)를 포함해야 한다.
+*임의의* 유효한 Sentry MCP `get_issue_details` 응답에 대해, 구조화 변환 결과는 SentryErrorDetail의 모든 필수 필드(issueId, shortId, title, errorMessage, stacktrace, projectSlug, level, environment, tags, breadcrumbs, issueUrl, slackAlertInfo)를 포함해야 한다.
 
 **Validates: Requirements 2.2, 2.4**
 
-### Property 5: LLM 프롬프트 필수 정보 포함
+### Property 5: LLM 프롬프트에 오류 정보 및 Seer 분석 결과 포함
 
-*임의의* SentryErrorDetail에 대해, LLM에 전달되는 프롬프트 문자열은 오류 메시지, 스택트레이스, 브레드크럼 정보를 모두 포함해야 한다.
+*임의의* SentryErrorDetail에 대해, LLM에 전달되는 프롬프트 문자열은 오류 메시지, 스택트레이스, 브레드크럼 정보를 모두 포함해야 하며, seerAnalysis가 존재하는 경우 Seer의 근본 원인 분석과 코드 수정 제안도 프롬프트에 포함되어야 한다.
 
-**Validates: Requirements 3.1**
+**Validates: Requirements 2.5, 3.1**
 
 ### Property 6: 분석 결과 완전성
 
-*임의의* 유효한 AnalysisResult에 대해, summary, rootCause, impactScope, relatedCode, possibleScenarios 필드가 비어있지 않아야 하며, solutions 배열은 최소 1개 이상의 항목을 포함해야 한다.
+*임의의* 유효한 AnalysisResult에 대해, summary, rootCause, impactScope, relatedCode, possibleScenarios 필드가 비어있지 않아야 하며, riskLevel이 유효한 값('high', 'medium', 'low')이어야 하고, solutions 배열은 최소 1개 이상의 항목을 포함해야 한다.
 
 **Validates: Requirements 3.2, 3.3**
 
@@ -521,7 +666,7 @@ type DedupStore = Map<string, number>;
 
 ### Property 8: 스레드 응답 필수 정보 포함
 
-*임의의* AnalysisResult, 담당자 Slack ID, Sentry 이슈 URL에 대해, buildResponse 함수가 생성한 Block Kit 블록은 오류 요약, 추정 원인, 영향 범위, 해결 대안, 즉시 대응 조치, 담당자 멘션(`<@사용자ID>`), Sentry 이벤트 링크를 모두 포함해야 하며, 유효한 Slack Block Kit 구조여야 한다.
+*임의의* AnalysisResult, 담당자 Slack ID, Sentry 이슈 URL에 대해, buildResponse 함수가 생성한 Block Kit 블록은 오류 요약, 추정 원인, 위험도, 영향 범위, 해결 대안, 즉시 대응 조치, 담당자 멘션(`<@사용자ID>`), Sentry 이벤트 링크를 모두 포함해야 하며, 유효한 Slack Block Kit 구조여야 한다.
 
 **Validates: Requirements 5.1, 5.2, 5.3**
 
@@ -551,11 +696,13 @@ type DedupStore = Map<string, number>;
 
 ## 오류 처리
 
-### 외부 API 실패
+### 외부 서비스 실패
 
 | 실패 지점 | 처리 방식 | 근거 |
 |-----------|----------|------|
-| Sentry API 호출 실패 | Slack 메시지 본문에서 추출 가능한 정보만으로 분석 진행 | 요구사항 2.3 |
+| Sentry MCP `get_issue_details` 실패 | Slack 메시지 본문에서 추출 가능한 정보만으로 분석 진행 | 요구사항 2.3 |
+| Sentry MCP `analyze_issue_with_seer` 실패 | Seer 분석 없이 LLM 분석만으로 진행 (seerAnalysis: null) | 요구사항 2.5 |
+| MCP 서버 연결 실패 | MCP 클라이언트 재연결 시도 후, 실패 시 SentryAlertInfo만으로 진행 | 요구사항 2.3 |
 | LLM API 호출 실패 | 오류 정보 요약만 포함한 기본 응답 생성 | 요구사항 3.4 |
 | Slack API 호출 실패 | 최대 3회 재시도 (지수 백오프), 3회 실패 시 관리자 알림 | 요구사항 5.4, 5.5 |
 
@@ -588,7 +735,7 @@ async function withRetry<T>(
 
 ### 로깅
 
-- 모든 외부 API 호출의 성공/실패를 로깅
+- 모든 MCP 도구 호출 및 외부 API 호출의 성공/실패를 로깅
 - 오류 발생 시 컨텍스트 정보(이슈 ID, 채널 ID 등) 포함
 - 구조화된 로그 형식 (JSON) 사용
 
@@ -605,10 +752,10 @@ async function withRetry<T>(
 단위 테스트는 구체적인 예시, 에지 케이스, 오류 조건에 집중한다.
 
 - **MessageDetector**: Sentry 봇 메시지 (봇 이름 "Sentry", Short ID 포함), Sentry URL 포함 메시지, 일반 메시지 각각의 판별 결과. Short ID/프로젝트명/이벤트 수 등 메타 정보 추출 정확성
-- **SentryCollector**: Short ID 기반 조회 성공, Short ID 조회 실패 시 fallback 동작, API 실패 시 SentryAlertInfo 기반 분석 진행 (요구사항 2.3)
-- **LLMAnalyzer**: LLM API 실패 시 기본 응답 생성 (요구사항 3.4)
-- **ThreadResponder**: Slack API 재시도 로직 (3회 재시도 후 관리자 알림, 요구사항 5.4, 5.5)
-- **ConfigManager**: 필수 설정 누락 시 오류 메시지 검증
+- **SentryMcpCollector**: `get_issue_details` 호출 성공, `analyze_issue_with_seer` 호출 성공/실패, MCP 연결 실패 시 fallback 동작, 모든 MCP 호출 실패 시 SentryAlertInfo 기반 분석 진행 (요구사항 2.3)
+- **LLMAnalyzer**: Seer 분석 결과가 있는 경우와 없는 경우의 프롬프트 구성 차이, LLM API 실패 시 기본 응답 생성 (요구사항 3.4)
+- **ThreadResponder**: 위험도별 이모지 표시 (🔴/⚠️/🟢), Slack API 재시도 로직 (3회 재시도 후 관리자 알림, 요구사항 5.4, 5.5)
+- **ConfigManager**: 필수 설정 누락 시 오류 메시지 검증, sentryMcp 설정 검증
 
 ### 속성 기반 테스트
 
@@ -623,11 +770,11 @@ async function withRetry<T>(
 | Property 1 | MessageDetector | 임의의 SlackMessage (Sentry 봇 ID/이름 + 구조적 패턴 / 일반 메시지) |
 | Property 2 | MessageDetector | 임의의 Sentry 알림 메시지 + ts 값 |
 | Property 3 | MessageDetector | 임의의 Sentry 알림 메시지 (Short ID, 프로젝트명, 이벤트 수, 에러 메시지 포함) |
-| Property 4 | SentryCollector | 임의의 SentryShortIdResponse + SentryEventResponse 객체 |
-| Property 5 | LLMAnalyzer | 임의의 SentryErrorDetail 객체 |
+| Property 4 | SentryMcpCollector | 임의의 McpIssueDetailsResponse 객체 |
+| Property 5 | LLMAnalyzer | 임의의 SentryErrorDetail 객체 (seerAnalysis 포함/미포함) |
 | Property 6 | LLMAnalyzer | 임의의 AnalysisResult 객체 |
 | Property 7 | AssigneeMapper | 임의의 프로젝트명 + 오류 유형 + 매핑 설정 |
-| Property 8 | ThreadResponder | 임의의 AnalysisResult + 담당자 ID + 이슈 URL |
+| Property 8 | ThreadResponder | 임의의 AnalysisResult (위험도 포함) + 담당자 ID + 이슈 URL |
 | Property 9 | DedupCache | 임의의 Short ID 문자열 |
 | Property 10 | DedupCache | 임의의 Short ID + TTL 값 |
 | Property 11 | ConfigManager | 임의의 유효한 AppConfig 객체 |
@@ -635,6 +782,7 @@ async function withRetry<T>(
 
 ### 통합 테스트
 
-- 전체 파이프라인 흐름 (메시지 감지 → 정보 수집 → 분석 → 응답)을 모킹된 외부 API로 검증
+- 전체 파이프라인 흐름 (메시지 감지 → MCP 정보 수집 → Seer 분석 → LLM 분석 → 응답)을 모킹된 MCP 클라이언트와 외부 API로 검증
 - Slack Socket Mode 연결 및 이벤트 수신 검증
+- MCP 서버 연결 실패 시 graceful degradation 검증
 - 설정 파일 핫 리로드 동작 검증
